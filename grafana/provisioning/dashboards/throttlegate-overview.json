@@ -1,0 +1,38 @@
+{
+  "title": "ThrottleGate Overview",
+  "uid": "throttlegate-overview",
+  "panels": [
+    {
+      "title": "Request Rate",
+      "type": "graph",
+      "targets": [{ "expr": "rate(http_requests_total[1m])", "legendFormat": "{{method}} {{route}}" }]
+    },
+    {
+      "title": "P95 Latency",
+      "type": "graph",
+      "targets": [{ "expr": "http_request_duration_seconds{p95}", "legendFormat": "p95" }]
+    },
+    {
+      "title": "Rate Limited Requests",
+      "type": "graph",
+      "targets": [{ "expr": "rate(rate_limiter_blocked_total[5m])", "legendFormat": "blocked" }]
+    },
+    {
+      "title": "Circuit Breaker State",
+      "type": "stat",
+      "targets": [{ "expr": "circuit_breaker_state" }]
+    },
+    {
+      "title": "Active Connections",
+      "type": "stat",
+      "targets": [{ "expr": "active_connections" }]
+    },
+    {
+      "title": "Error Rate",
+      "type": "graph",
+      "targets": [{ "expr": "rate(http_requests_total{status=~\"5..\"}[5m]) / rate(http_requests_total[5m]) * 100", "legendFormat": "5xx %" }]
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

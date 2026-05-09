@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { getConfig } from "../config";
 import { securityMetrics } from "../metrics/prometheus";
+import { getRedisClient } from "../services/redis";
 
 export interface AuthUser {
   id: string;
@@ -18,14 +19,36 @@ declare global {
   }
 }
 
-// Simple API key -> tenant/tier mapping (in production, query Redis)
-const API_KEY_STORE = new Map<string, { tenantId: string; tier: string }>([
-  ["sk-free-123", { tenantId: "tenant-free", tier: "free" }],
-  ["sk-pro-456", { tenantId: "tenant-pro", tier: "pro" }],
-  ["sk-enterprise-789", { tenantId: "tenant-ent", tier: "enterprise" }],
-]);
+const CACHE_TTL = 300;
+const keyCache = new Map<string, { tenantId: string; tier: string }>();
 
-export function apiKeyAuth(req: Request, res: Response, next: NextFunction): void {
+async function lookupApiKey(apiKey: string): Promise<{ tenantId: string; tier: string } | null> {
+  const cached = keyCache.get(apiKey);
+  if (cached) return cached;
+
+  try {
+    const redis = getRedisClient();
+    const data = await redis.get(`apikey:${apiKey}`);
+    if (data) {
+      const parsed = JSON.parse(data) as { tenantId: string; tier: string };
+      keyCache.set(apiKey, parsed);
+      setTimeout(() => keyCache.delete(apiKey), CACHE_TTL * 1000);
+      return parsed;
+    }
+  } catch {
+    // Redis unavailable — fall back to legacy store
+  }
+
+  const legacyStore = new Map<string, { tenantId: string; tier: string }>([
+    ["sk-free-123", { tenantId: "tenant-free", tier: "free" }],
+    ["sk-pro-456", { tenantId: "tenant-pro", tier: "pro" }],
+    ["sk-enterprise-789", { tenantId: "tenant-ent", tier: "enterprise" }],
+  ]);
+
+  return legacyStore.get(apiKey) ?? null;
+}
+
+export async function apiKeyAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   const apiKey = req.headers["x-api-key"] as string | undefined;
   if (!apiKey) {
     securityMetrics.authFailures.inc({ reason: "missing_api_key" });
@@ -33,7 +56,7 @@ export function apiKeyAuth(req: Request, res: Response, next: NextFunction): voi
     return;
   }
 
-  const mapping = API_KEY_STORE.get(apiKey);
+  const mapping = await lookupApiKey(apiKey);
   if (!mapping) {
     securityMetrics.authFailures.inc({ reason: "invalid_api_key" });
     res.status(403).json({ error: "Forbidden", message: "Invalid API key" });

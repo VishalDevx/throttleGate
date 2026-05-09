@@ -1,27 +1,22 @@
 import { Request, Response, NextFunction } from "express";
+import { logger } from "../metrics/logger";
 
 interface PendingRequest {
-  promise: Promise<void>;
-  resolve: () => void;
+  resolve: (result: CoalescedResponse) => void;
   reject: (err: Error) => void;
   createdAt: number;
 }
 
-/**
- * Request coalescing/deduplication middleware.
- * When multiple identical GET requests arrive simultaneously,
- * only one reaches the backend — the rest share the same response.
- * 
- * Uses a map of request-hash -> pending promise.
- */
-class RequestCoalescer {
-  // Key: method:path:query -> PendingRequest
-  private pending = new Map<string, PendingRequest>();
+interface CoalescedResponse {
+  statusCode: number;
+  headers: Record<string, string | string[]>;
+  body: Buffer;
+}
 
-  /**
-   * Generates a coalescing key for dedup purposes
-   * Only coalesces GET and HEAD requests (idempotent methods)
-   */
+class RequestCoalescer {
+  private pending = new Map<string, PendingRequest>();
+  private readonly MAX_WAIT_MS = 30000;
+
   private getCoalesceKey(req: Request): string | null {
     const method = req.method.toUpperCase();
     if (method !== "GET" && method !== "HEAD") return null;
@@ -33,8 +28,6 @@ class RequestCoalescer {
   middleware(): (req: Request, res: Response, next: NextFunction) => void {
     return (req: Request, res: Response, next: NextFunction): void => {
       const key = this.getCoalesceKey(req);
-
-      // Only coalesce idempotent requests
       if (!key) {
         next();
         return;
@@ -42,24 +35,26 @@ class RequestCoalescer {
 
       const existing = this.pending.get(key);
       if (existing) {
-        // Dedup: wait for the in-flight request to complete
-        // The first request's response will be piped to the original res
-        // For dedup, we need to hook into the response. This is complex.
-        // Simplified: we just let it through but mark it as coalesced.
         (req as any).__coalesced = true;
 
-        // In a full implementation, we'd buffer the first response and replay it.
-        // For now, we track coalescing events.
         existing.promise
-          .then(() => next())
-          .catch(() => next());
+          .then((cached) => {
+            res.status(cached.statusCode);
+            for (const [name, value] of Object.entries(cached.headers)) {
+              res.setHeader(name, value);
+            }
+            res.end(cached.body);
+          })
+          .catch((err) => {
+            logger.error({ err, key }, "Coalesced request failed, proxying");
+            next();
+          });
         return;
       }
 
-      // Create a new pending entry
-      let resolve: () => void;
+      let resolve: (result: CoalescedResponse) => void;
       let reject: (err: Error) => void;
-      const promise = new Promise<void>((res, rej) => {
+      const promise = new Promise<CoalescedResponse>((res, rej) => {
         resolve = res;
         reject = rej;
       });
@@ -71,15 +66,32 @@ class RequestCoalescer {
         createdAt: Date.now(),
       });
 
-      // Wrap the original end to signal completion
+      const chunks: Buffer[] = [];
+
+      const originalWrite = res.write.bind(res);
+      res.write = (chunk: any, ...args: any[]) => {
+        if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        return originalWrite(chunk, ...args);
+      };
+
       const originalEnd = res.end.bind(res);
       res.end = (...args: any[]) => {
+        if (args[0]) chunks.push(Buffer.isBuffer(args[0]) ? args[0] : Buffer.from(args[0]));
+        res.end = originalEnd;
+
+        const body = Buffer.concat(chunks);
+        const headers: Record<string, string | string[]> = {};
+        for (const [name, value] of Object.entries(res.getHeaders())) {
+          if (value !== undefined) headers[name] = value as string | string[];
+        }
+
         this.pending.delete(key);
-        resolve!();
+        this.cleanup();
+        resolve!({ statusCode: res.statusCode, headers, body });
+
         return originalEnd(...args);
       };
 
-      // Clean up on error
       const originalDestroy = res.destroy.bind(res);
       res.destroy = (error?: Error) => {
         this.pending.delete(key);
@@ -95,11 +107,10 @@ class RequestCoalescer {
     return this.pending.size;
   }
 
-  // Periodically clean up stale pending entries (older than 30s)
   cleanup(): void {
     const now = Date.now();
     for (const [key, pending] of this.pending) {
-      if (now - pending.createdAt > 30000) {
+      if (now - pending.createdAt > this.MAX_WAIT_MS) {
         pending.reject(new Error("Coalesced request timed out"));
         this.pending.delete(key);
       }

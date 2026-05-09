@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: throttle-gate
+    env: docker
+    dockerfilePath: Dockerfile
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: throttle-gate-redis
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+
+redis:
+  - name: throttle-gate-redis
+    plan: starter
