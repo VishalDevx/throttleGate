@@ -1,0 +1,4 @@
+FROM node:20-alpine
+RUN mkdir -p /app && \
+    echo 'const http = require("http"); const srv = http.createServer((req, res) => { res.writeHead(200, {"Content-Type":"application/json"}); res.end(process.env.MOCK_RESPONSE || "{}"); }); srv.listen(3000, () => console.log(process.env.SERVICE_NAME+" running"));' > /app/server.js
+CMD ["node", "/app/server.js"]
